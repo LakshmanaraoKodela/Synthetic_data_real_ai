@@ -1,0 +1,645 @@
+import pandas as pd
+import numpy as np
+import logging
+import names
+import gender_guesser.detector as gender
+from sdv.metadata import SingleTableMetadata
+from sdv.single_table import GaussianCopulaSynthesizer
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import geonamescache
+import random
+from timezonefinder import TimezoneFinder
+from datetime import datetime
+import dask.dataframe as dd
+from dask.diagnostics import ProgressBar
+from timezonefinder import TimezoneFinder
+import geopy.geocoders
+import pycountry
+import geonamescache
+import phonenumbers
+import re
+import time
+import json
+from mimesis import Address
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Gender Detection
+d = gender.Detector()
+
+name_columns = [
+    'Name', 'name', 'NAME',
+    'User Name', 'user name', 'User Name', 'USER NAME',
+    'Full Name', 'full name', 'Full Name', 'FULL NAME',
+    'Display Name', 'display name', 'Display Name', 'DISPLAY NAME',
+    'Username', 'username', 'Username', 'USERNAME',
+    'Names', 'names', 'NAMES',
+    'User Names', 'user names', 'User Names', 'USER NAMES',
+    'Full Names', 'full names', 'Full Names', 'FULL NAMES',
+    'Display Names', 'display names', 'Display Names', 'DISPLAY NAMES',
+    'Usernames', 'usernames', 'Usernames', 'USERNAMES',
+    'User-Name', 'user-name', 'User-Name', 'USER-NAME',
+    'Full_Name', 'full_name', 'Full_Name', 'FULL_NAME',
+    'Display-Name', 'display-name', 'Display-Name', 'DISPLAY-NAME',
+    'User_Names', 'user_names', 'User_Names', 'USER_NAMES',
+    'Full_Names', 'full_names', 'Full_Names', 'FULL_NAMES',
+    'Display_Names', 'display_names', 'Display_Names', 'DISPLAY_NAMES',
+    'UserName', 'username', 'USERNAME',
+    'FullName', 'fullname', 'FULLNAME',
+    'DisplayName', 'displayname', 'DISPLAYNAME'
+    
+]
+
+
+gender_column=['gender','Gender','GENDER','SEX','sex','Sex']
+
+
+phone_number_columns = [
+    "phone", "Phone", "PHONE",
+    "phone_number", "Phone_number", "PHONE_NUMBER",
+    "phoneNumber", "PhoneNumber", "PHONENUMBER",
+    "mobile", "Mobile", "MOBILE",
+    "cell", "Cell", "CELL",
+    "contact", "Contact", "CONTACT",
+    "telephone", "Telephone", "TELEPHONE",
+    "mobile_number", "Mobile_number", "MOBILE_NUMBER",
+    "mobileNumber", "MobileNumber", "MOBILENUMBER",
+    "cell_number", "Cell_number", "CELL_NUMBER",
+    "cellNumber", "CellNumber", "CELLNUMBER",
+    "contact_number", "Contact_number", "CONTACT_NUMBER",
+    "contactNumber", "ContactNumber", "CONTACTNUMBER",
+    "phone_no", "Phone_no", "PHONE_NO",
+    "phoneNo", "PhoneNo", "PHONENO",
+    "tel", "Tel", "TEL"
+]
+
+email_columns = [
+    "email", "Email", "EMAIL",
+    "email_address", "Email_address", "EMAIL_ADDRESS",
+    "emailAddress", "EmailAddress", "EMAILADDRESS",
+    "e_mail", "E_mail", "E_MAIL",
+    "eMail", "EMail", "EMAIL",
+    "e_mail_address", "E_mail_address", "E_MAIL_ADDRESS",
+    "eMailAddress", "EMailAddress", "EMAILADDRESS",
+    "eaddress", "Eaddress", "EADDRESS",
+    "eAddress", "EAddress", "EADDRESS",
+    "contact_email", "Contact_email", "CONTACT_EMAIL",
+    "contactEmail", "ContactEmail", "CONTACTEMAIL",
+    "electronic_mail", "Electronic_mail", "ELECTRONIC_MAIL",
+    "electronicMail", "ElectronicMail", "ELECTRONICMAIL",
+    "email_id", "Email_id", "EMAIL_ID",
+    "emailId", "EmailId", "EMAILID",
+    "mail", "Mail", "MAIL"
+]
+
+income_related_columns = [
+    "income", "Income", "INCOME",
+    "annual_income", "Annual_income", "ANNUAL_INCOME",
+    "annualIncome", "AnnualIncome", "ANNUALINCOME",
+    "yearly_income", "Yearly_income", "YEARLY_INCOME",
+    "yearlyIncome", "YearlyIncome", "YEARLYINCOME",
+    "total_income", "Total_income", "TOTAL_INCOME",
+    "totalIncome", "TotalIncome", "TOTALINCOME",
+    "gross_income", "Gross_income", "GROSS_INCOME",
+    "grossIncome", "GrossIncome", "GROSSINCOME",
+    "net_income", "Net_income", "NET_INCOME",
+    "netIncome", "NetIncome", "NETINCOME",
+    "salary", "Salary", "SALARY",
+    "compensation", "Compensation", "COMPENSATION",
+    "earnings", "Earnings", "EARNINGS",
+    "wages", "Wages", "WAGES",
+    "pay", "Pay", "PAY"
+]
+
+ssn_columns = [
+    "ssn", "SSN", "social_security_number", "Social_Security_Number",
+    "socialSecurityNumber", "SocialSecurityNumber", "social_security_no", "Social_Security_No"
+]
+
+
+date_of_birth_columns = [
+    'Date of Birth', 'date of birth', 'DATE OF BIRTH',
+    'DOB', 'dob', 'Dob',
+    'Birth Date', 'birth date', 'BIRTH DATE',
+    'Birthdate', 'birthdate', 'BIRTHDATE',
+    'DoB', 'doB', 'DoB',
+    'DateOfBirth', 'dateofbirth', 'DATEOFBIRTH',
+    'Birth_Day', 'birth_day', 'BIRTH_DAY','Date_of_Birth',
+    'Birth-Day', 'birth-day', 'BIRTH-DAY'
+]
+
+# Function to validate schema
+def validate_schema(schema):
+    """Validate the schema for synthetic data generation."""
+    for col_name, col_schema in schema.items():
+        if 'type' not in col_schema:
+            raise ValueError(f"Column '{col_name}' must have a 'type' specified.")
+        col_type = col_schema['type']
+        if col_type not in ['categorical', 'integer', 'date', 'string', 'mixed', 'float','boolean']:
+            raise ValueError(f"Unsupported type '{col_type}' for column '{col_name}'.")
+
+# Function to generate dummy value
+def generate_dummy_value(col_name, col_schema, fit_dataframe=None, row_index=None, country=None):
+    """Generate a dummy value based on the column schema."""
+    col_type = col_schema['type']
+    
+    if col_type == 'string':
+        if col_name.lower() in [col.lower() for col in email_columns]:
+            if row_index is not None and any(col in fit_dataframe.columns for col in name_columns):
+                for name_col in name_columns:
+                    if name_col in fit_dataframe.columns:
+                        name_value = fit_dataframe.loc[row_index, name_col]
+                        break
+                if isinstance(name_value, pd.Series):
+                    name = name_value.iloc[0]  # Take the first value from the Series
+                else:
+                    name = name_value
+                name = str(name)  # Ensure name is a string
+                return generate_email_with_name(name)
+            else:
+                return 'Dummy Email'
+        
+        elif col_name in name_columns:
+            return generate_name()
+        
+        elif col_name.lower() in [col.lower() for col in phone_number_columns]:
+            return generate_phone_number(country)
+        
+        elif col_name.lower() == 'education':
+            return generate_education_level()
+        
+        elif col_name.lower() == 'organization':
+            return generate_organization()
+        
+        elif col_name.lower() == 'occupation':
+            return generate_occupation()
+        
+        elif col_name.lower() == 'postal_code':
+            return generate_postal_code()
+        
+        elif col_name.lower() == 'marital_status':
+            return generate_marital_status('unknown')
+
+        elif col_name.lower() == 'address':
+            return generate_Address()
+        
+        elif col_name in gender_column:
+            return generate_gender()
+            
+        elif col_name in ssn_columns:  # Handling SSN column
+            return generate_ssn()  # Use custom function to generate SSN # Use custom function to generate SSN # Use custom function to generate SSN
+            
+        elif col_name.lower() == 'bloodtype':
+            return generate_blood_type()
+        
+        else:
+            return 'Dummy'
+    
+    elif col_type == 'categorical':
+        return np.random.choice(col_schema['values'])
+    
+    elif col_type == 'integer':
+        if col_name.lower() == 'experience':
+            return generate_experience()
+        else:
+            return np.random.randint(col_schema.get('min', 0), col_schema.get('max', 100))
+    
+    elif col_type == 'date':
+       
+        if col_name in date_of_birth_columns:
+            return generate_date_of_birth()
+        else:
+            # Generate a random date relative to current date
+             current_date = pd.Timestamp.now().normalize()  # Normalize to midnight
+             days_offset = np.random.randint(-365 * 50, 365 * 50)  # Random offset up to 50 years in the past or future
+             return current_date + pd.Timedelta(days=days_offset)
+    
+    elif col_type == 'mixed':
+        return generate_mixed_value(col_schema)
+       
+    elif col_type == 'float':
+        if col_name in income_related_columns:
+           return generate_income()
+        else:
+           return np.random.uniform(col_schema.get('min', 10), col_schema.get('max', 100))
+    elif col_type == 'boolean':
+        return np.random.choice([True, False])
+    else:
+        return None
+
+
+def generate_date_of_birth():
+    """Generate a random date of birth between 1950-01-01 and 2001-12-31."""
+    start_date = pd.Timestamp('1950-01-01')
+    end_date = pd.Timestamp('2001-12-31')
+    random_date = start_date + pd.Timedelta(days=np.random.randint((end_date - start_date).days))
+    return random_date
+
+
+# Function to generate email with name
+def generate_email_with_name(name):
+    """Generate an email address using the given name."""
+    parts = name.split()
+    first_name = parts[0]
+    last_name = parts[-1] if len(parts) > 1 else ''
+    email_formats = [
+        f"{first_name.lower()}.{last_name.lower()}",
+        f"{first_name.lower()}{last_name.lower()}",
+        f"{first_name.lower()}.{random.randint(0, 99)}",
+        f"{first_name.lower()}{random.randint(0, 99)}",
+        f"{first_name.lower()}_{last_name.lower()}",
+        f"{first_name[0].lower()}{last_name.lower()}",
+        f"{first_name.lower()}"
+    ]
+    domain = random.choice(['gmail.com', 'yahoo.com', 'hotmail.com', 'example.com', 'company.com'])
+    return f"{random.choice(email_formats)}@{domain}"
+
+
+def generate_ssn():
+    """Generate a valid SSN in the format XXX-XX-XXXX."""
+    first_part = ''.join([str(random.randint(0, 9)) for _ in range(3)])
+    second_part = ''.join([str(random.randint(0, 9)) for _ in range(2)])
+    third_part = ''.join([str(random.randint(0, 9)) for _ in range(4)])
+    return f"{first_part}-{second_part}-{third_part}"
+
+
+def generate_income():
+    """Generate a random income value between 10,000 and 5,000,000."""
+    return round(np.random.uniform(10000.12, 5000000.00), 2)
+
+
+# Function to generate synthetic data using GaussianCopulaSynthesizer
+def generate_synthetic_data(schema, num_rows=10_000, seed=None):
+    """Generate synthetic data based on the given schema."""
+    validate_schema(schema)
+    metadata = SingleTableMetadata()
+
+    for col_name, col_schema in schema.items():
+        col_type = col_schema['type']
+        sdtype = col_schema.get('sdtype')
+        if col_type == 'categorical':
+            metadata.add_column(
+                column_name=col_name,
+                sdtype=sdtype if sdtype is not None else 'categorical',
+            )
+        else:
+            metadata.add_column(
+                column_name=col_name,
+                **{k: v for k, v in col_schema.items() if k not in ['type', 'values', 'generator']}
+            )
+    
+    synthesizer = GaussianCopulaSynthesizer(metadata, default_distribution='beta')
+    np.random.seed(seed)
+
+    logger.info("Generating synthetic data...")
+
+    try:
+        dask_fit_dataframe = dd.from_pandas(pd.DataFrame(columns=[col_name for col_name in metadata.columns.keys()]), npartitions=8)
+
+        rows = []
+        with ThreadPoolExecutor() as executor:
+            futures = []
+            for idx in range(0, num_rows, 100_000):
+                future = executor.submit(generate_batch, idx, min(idx + 100_000, num_rows), schema, dask_fit_dataframe)
+                futures.append(future)
+
+            for future in as_completed(futures):
+                rows.extend(future.result())
+
+        dask_fit_dataframe = dd.from_pandas(pd.DataFrame(rows), npartitions=8)
+        logger.info("Fit DataFrame shape: %s", dask_fit_dataframe.shape)
+        
+        synthesizer.fit(dask_fit_dataframe.compute())
+        synthetic_data = synthesizer.sample(num_rows=num_rows)
+    except Exception as e:
+        logger.error("Error generating synthetic data: %s", e)
+        raise
+
+    logger.info("Synthetic data generation completed.")
+      
+# Add the id column with a sequence of numbers based on the index
+    synthetic_data['id'] =range(1,num_rows + 1)
+    try:
+        synthetic_data = transform_data(synthetic_data, schema)
+    except Exception as e:
+        logger.error("Error transforming synthetic data: %s", e)
+        raise
+    
+    return synthetic_data
+
+
+def generate_batch(start_idx, end_idx, schema, fit_dataframe):
+    """Generate a batch of synthetic data."""
+    rows = []
+    for idx in range(start_idx, end_idx):
+        row = {}
+        for col_name, col_schema in schema.items():
+            row[col_name] = generate_dummy_value(col_name, col_schema, fit_dataframe, idx)
+        rows.append(row)
+    return rows
+
+# Function to transform data
+def transform_data(data, schema):
+    """Transform synthetic data according to the schema."""
+    for col_name, col_schema in schema.items():
+        col_type = col_schema['type']
+        if col_type == 'integer':
+            min_value = col_schema.get('min', None)
+            max_value = col_schema.get('max', None)
+            if min_value is not None and max_value is not None:
+                data[col_name] = data[col_name].apply(lambda x: min(max(int(x), min_value), max_value))
+        elif col_type == 'date':
+            data[col_name] = pd.to_datetime(data[col_name], errors='coerce').fillna(pd.Timestamp.now().normalize())
+
+        elif col_type == 'boolean':
+            data[col_name] = data[col_name].astype(bool)
+        else:
+            sdtype = col_schema.get('sdtype', None)
+            if sdtype:
+                if sdtype == 'integer':
+                    data[col_name] = data[col_name].astype(int)
+                elif sdtype == 'float':
+                    data[col_name] = data[col_name].astype(float)
+                elif sdtype == 'timestamp':
+                    data[col_name] = pd.to_datetime(data[col_name], errors='coerce')
+
+    return data
+
+
+
+# Function to generate name
+def generate_name():
+    """Generate a random name."""
+    return names.get_full_name()
+
+# Function to generate organization
+def generate_organization():
+    """Generate a random organization."""
+    organizations = ['Company A', 'Company B', 'Company C', 'Company D', 'Company E']
+    return np.random.choice(organizations)
+
+# Function to generate experience
+def generate_experience():
+    """Generate random experience years."""
+    return np.random.randint(0, 40)
+
+# Function to generate occupation
+def generate_occupation():
+    """Generate a random occupation."""
+    occupations = ['Engineer', 'Doctor', 'Teacher', 'Artist', 'Lawyer']
+    return np.random.choice(occupations)
+
+# Function to generate education level
+def generate_education_level():
+    """Generate a random education level."""
+    education_levels = ['High School', 'Associate Degree', 'Bachelor\'s Degree', 'Master\'s Degree', 'PhD']
+    return np.random.choice(education_levels)
+
+# Function to generate postal code
+def generate_postal_code():
+    """Generate a random postal code."""
+    return f"{np.random.randint(10000, 99999)}"
+
+# Function to generate marital status
+def generate_marital_status(gender):
+    """Generate a random marital status."""
+    marital_statuses = ['single', 'married', 'divorced', 'widowed']
+    return np.random.choice(marital_statuses)
+
+# Function to generate blood type
+def generate_blood_type():
+    """Generate a random blood type."""
+    blood_types = ['A+', 'A-', 'B+', 'B-', 'AB+', 'AB-', 'O+', 'O-']
+    return np.random.choice(blood_types)
+
+# Function to generate phone number
+
+def generate_phone_number(country_code):
+    """Generate a random phone number based on the country code."""
+    phone_number = ''.join([str(np.random.randint(0, 10)) for _ in range(8)])
+    return f"{country_code} {phone_number}"
+
+# Function to generate geographical data
+def generate_geographical_data(num_rows):
+    """Generate geographical data for the specified number of rows."""
+    gc = geonamescache.GeonamesCache()
+    tf = TimezoneFinder()
+    geolocator = geopy.geocoders.Nominatim(user_agent="geoapiExercises")
+
+    # Get country and city data
+    countries = gc.get_countries()
+    cities = gc.get_cities()
+
+    records = []
+
+    for _ in range(num_rows):
+        city = random.choice(list(cities.values()))
+        city_name = city['name']
+        country_iso = city['countrycode']
+        country_name = countries[country_iso]['name'] if country_iso in countries else None
+
+        # Skip if country name is not found
+        if not country_name:
+            continue
+
+        # Try to infer state or province using pycountry
+        state, state_code = 'N/A', 'N/A'
+        try:
+            country = pycountry.countries.get(alpha_2=country_iso)
+            if country:
+                subdivisions = list(pycountry.subdivisions.get(country_code=country.alpha_2))
+                if subdivisions:
+                    subdivision = random.choice(subdivisions)
+                    state = subdivision.name
+                    state_code = subdivision.code
+        except Exception as e:
+            print(f"Error occurred while retrieving state/province information: {e}")
+
+        # Use timezonefinder to get timezone from lat, long
+        latitude = city['latitude']
+        longitude = city['longitude']
+        time_zone = tf.timezone_at(lng=longitude, lat=latitude)
+
+        # Get country dial code using phonenumbers
+        try:
+            dial_code = phonenumbers.country_code_for_region(country.alpha_2)
+        except Exception as e:
+            dial_code = 'N/A'
+
+        # Additional data (example: population)
+        city_population = city['population'] if 'population' in city else None
+
+        record = {
+            "Country": country_name,
+            "Country Code": country_iso,
+            "Dial Code": f"+{dial_code}",
+            "State": state,
+            "State Code": state_code,
+            "City": city_name,
+            "Region": f"{state}, {country_name}" if state != 'N/A' else country_name,
+            "Latitude": latitude,
+            "Longitude": longitude,
+            "Time Zone": time_zone if time_zone else "N/A",
+            "City Population": city_population
+        }
+
+        records.append(record)
+
+    # Convert to DataFrame
+    df = pd.DataFrame(records)
+    return df
+
+
+
+def generate_gender(name=None):
+    """Generate a gender based on the given name."""
+    if not name:
+        name = names.get_first_name()
+
+    gender_prediction = d.get_gender(name.split()[0])
+
+    if gender_prediction in ['male', 'mostly_male']:
+        return 'male'
+    elif gender_prediction in ['female', 'mostly_female']:
+        return 'female'
+    else:
+        return 'other'
+
+# Function to generate unique genders based on names
+def generate_unique_genders(names):
+    """Generate unique genders based on the provided names."""
+    return [generate_gender(name) for name in names]
+
+# Function to determine the prefix based on gender
+def get_prefix(row, gender_col):
+    if row[gender_col].lower() in ['male', 'm']:
+        return 'Mr'
+    elif row[gender_col].lower() in ['female', 'f']:
+        return 'Mrs./Ms./Miss'
+    else:
+        return ''
+
+def validate_ssn_format(ssn):
+    """Validate SSN format (XXX-XX-XXXX)."""
+    pattern = re.compile(r'^\d{3}-\d{2}-\d{4}$')
+    return pattern.match(ssn) is not None
+
+def generate_Address():
+    """Generate a random address."""
+    address = Address()
+    random_address = address.address()
+    return random_address
+
+# Example schema
+schema = {
+    'id': {'type': 'integer', 'sdtype': 'numerical'},
+    'USERNAME': {'type': 'string', 'sdtype': 'categorical'},
+    'sex': {'type': 'string', 'sdtype': 'categorical'},
+    'DOB': {'type': 'date', 'sdtype': 'datetime'},
+    'Age': {'type': 'integer', 'sdtype': 'numerical'},
+    'salary': {'type': 'float', 'sdtype': 'numerical'},
+    'Marital_Status': {'type': 'string', 'sdtype': 'categorical'},
+    'contact_email': {'type': 'string', 'sdtype': 'categorical'},
+    'phone': {'type': 'string', 'sdtype': 'categorical'},
+    'Education': {'type': 'string', 'sdtype': 'categorical'},
+    'Organization': {'type': 'string', 'sdtype': 'categorical'},
+    'Experience': {'type': 'integer', 'sdtype': 'categorical'},
+    'Occupation': {'type': 'string', 'sdtype': 'categorical'},
+    'Postal_code': {'type': 'string', 'sdtype': 'categorical'},
+    'BloodType': {'type': 'string', 'sdtype': 'categorical'},
+    'Prefix': {'type': 'string', 'sdtype': 'categorical'},
+    'socialSecurityNumber': {'type': 'string', 'sdtype': 'categorical'},
+    'Have_health_insurence': {'type': 'boolean', 'sdtype': 'boolean'},
+    'Address': {'type': 'string', 'sdtype': 'categorical'}
+}
+
+# Generate synthetic data
+num_rows = 1000# Adjust number of rows here
+with ProgressBar():
+    start_time = datetime.now()  # Record the start time
+    synthetic_data = generate_synthetic_data(schema, num_rows=num_rows, seed=42)
+    end_time = datetime.now()  # Record the end time
+    print(f"Synthetic data generation completed in: {end_time - start_time}")
+
+# Generate geographical data
+geographical_data = generate_geographical_data(num_rows)
+geographical_data_sample = geographical_data.sample(n=len(synthetic_data), random_state=42).reset_index(drop=True)
+
+
+start_time = datetime.now()  # Record the start time
+# Merge geographical data with synthetic data
+synthetic_data = pd.concat([synthetic_data, geographical_data_sample], axis=1)
+end_time = datetime.now()  # Record the end time
+print(f"Synthetic data generation completed after concatination in: {end_time - start_time}")
+
+
+# Apply SSN validation if the column is present
+for col_name in ssn_columns:
+    if col_name in synthetic_data.columns:
+        synthetic_data['SSN_valid'] = synthetic_data[col_name].apply(validate_ssn_format)
+        break
+else:
+    logger.warning("No SSN column found in synthetic_data. Skipping SSN validation.")
+
+
+name_col = next((col for col in name_columns if col in synthetic_data.columns), None)
+
+if name_col:
+    for gender_col in gender_column:
+        if gender_col in synthetic_data.columns:
+            synthetic_data[gender_col] = generate_unique_genders(synthetic_data[name_col].tolist())
+            synthetic_data['Prefix'] = synthetic_data.apply(lambda row: get_prefix(row, gender_col), axis=1)
+            break
+else:
+    logger.warning("No name column found in synthetic_data. Skipping gender and prefix generation.")
+
+# Calculate age based on Date_of_Birth and current year
+current_year = datetime.now().year
+
+for dob_col in date_of_birth_columns:
+    if dob_col in synthetic_data.columns:
+        synthetic_data['Age'] = synthetic_data[dob_col].apply(lambda x: current_year - pd.to_datetime(x).year if pd.notnull(x) else None)
+        break
+else:
+    synthetic_data['Age'] = ''
+    raise ValueError("Date of Birth column not found in synthetic_data.")
+
+# Generate email and phone numbers
+# Generate email addresses
+for email_col in email_columns:
+    if email_col in synthetic_data.columns:
+        for name_col in name_columns:
+            if name_col in synthetic_data.columns:
+                synthetic_data[email_col] = synthetic_data.apply(lambda row: generate_email_with_name(row[name_col]), axis=1)
+                break
+        break
+
+# Generate phone numbers
+for phone_col in phone_number_columns:
+    if phone_col in synthetic_data.columns:
+        synthetic_data[phone_col] = synthetic_data.apply(lambda row: generate_phone_number(row['Dial Code']), axis=1)
+        break
+
+
+first_name_col = next((col for col in name_columns if col in synthetic_data.columns), None)
+
+if first_name_col:
+    cols = synthetic_data.columns.tolist()
+    cols.insert(cols.index(first_name_col), cols.pop(cols.index('Prefix')))
+    synthetic_data = synthetic_data[cols]
+else:
+    logger.warning("No name column found to place Prefix before. Prefix column position remains unchanged.")
+
+
+# Save synthetic data to CSV
+synthetic_data.to_csv('synthetic_data2L6.csv', index=False)
+
+print("Data generation and saving completed.")
+print(synthetic_data.head(10))
+# added Region.
+# DOB validation done.
+# bool
+# Address
+
+# The finalised code
